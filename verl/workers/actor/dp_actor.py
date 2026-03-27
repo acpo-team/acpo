@@ -126,6 +126,7 @@ class DataParallelPPOActor(BasePPOActor):
         """
         calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
         sum_pi_squared_checkpointing = self.config.get("sum_pi_squared_checkpointing", False)
+        calculate_max_prob = self.config.get("calculate_max_prob", False)
         # PrefixGrouper path for shared-prefix optimization
         if self.use_prefix_grouper:
             can_use_pg = (
@@ -289,6 +290,11 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                         )
 
+                    # Compute max_prob if requested (for ACPO surrogate entropy)
+                    if calculate_max_prob:
+                        with torch.no_grad():
+                            max_prob_rmpad = verl_F.max_prob_from_logits(logits_rmpad)
+
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
                     # gather and unpad for the ulysses sp
@@ -309,11 +315,17 @@ class DataParallelPPOActor(BasePPOActor):
                         sum_pi_squared_rmpad = gather_outputs_and_unpad(
                             sum_pi_squared_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
                         )
+                    if calculate_max_prob:
+                        max_prob_rmpad = gather_outputs_and_unpad(
+                            max_prob_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
+                        )
 
                 if is_mask_all_zero:
                     log_probs = log_probs[:0]
                     if calculate_entropy:
                         entropy_rmpad = entropy_rmpad[:0]
+                    if calculate_max_prob:
+                        max_prob_rmpad = max_prob_rmpad[:0]
 
                 # pad back to (bsz, seqlen)
                 if calculate_entropy:
@@ -326,6 +338,13 @@ class DataParallelPPOActor(BasePPOActor):
                 if calculate_sum_pi_squared:
                     full_sum_pi_squared = pad_input(
                         hidden_states=sum_pi_squared_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                if calculate_max_prob:
+                    full_max_prob = pad_input(
+                        hidden_states=max_prob_rmpad.unsqueeze(-1),
                         indices=indices,
                         batch=batch_size,
                         seqlen=seqlen,
@@ -343,6 +362,9 @@ class DataParallelPPOActor(BasePPOActor):
                 if calculate_sum_pi_squared:
                     # (bsz, response_length)
                     sum_pi_squared = full_sum_pi_squared.squeeze(-1)[:, -response_length - 1 : -1]
+                if calculate_max_prob:
+                    # (bsz, response_length)
+                    max_prob = full_max_prob.squeeze(-1)[:, -response_length - 1 : -1]
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
@@ -382,12 +404,18 @@ class DataParallelPPOActor(BasePPOActor):
                             if not sum_pi_squared_checkpointing
                             else torch.utils.checkpoint.checkpoint(self.calculate_sum_pi_squared_from_logits, logits)
                         )
+                    # Compute max_prob if requested (for ACPO surrogate entropy)
+                    if calculate_max_prob:
+                        with torch.no_grad():
+                            max_prob = verl_F.max_prob_from_logits(logits)  # (bsz, response_length)
 
             outputs = {"log_probs": log_probs}
             if calculate_entropy:
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
                 outputs["sum_pi_squared"] = sum_pi_squared
+            if calculate_max_prob:
+                outputs["max_prob"] = max_prob
             return outputs
 
     def _optimizer_step(self):
@@ -596,6 +624,7 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
+                    max_prob = outputs.get("max_prob", None)  # for ACPO surrogate entropy
 
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -626,6 +655,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
+                        max_prob=max_prob,
                     )
                     micro_batch_metrics.update(pg_metrics)
 

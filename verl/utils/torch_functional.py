@@ -680,6 +680,31 @@ def post_process_logits(input_ids, logits, temperature, top_k, top_p):
     return logits
 
 
+def max_prob_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Compute the maximum probability over the vocabulary from unnormalized logits.
+
+    Computes max_v softmax(logits)_v for each position, which is used in ACPO
+    to define the surrogate entropy δ = 1 - max_v π(v).
+
+    Args:
+        logits: Unnormalized log-probabilities of shape (..., vocab_size).
+
+    Returns:
+        torch.Tensor: Max probability values with shape (...,), one per distribution.
+    """
+    # Numerically stable: subtract max, exp, sum, then take local max / sum
+    logits_max = logits.max(dim=-1, keepdim=True).values
+    exp_logits = (logits - logits_max).exp()
+    sum_exp = exp_logits.sum(dim=-1, keepdim=True)
+    # max softmax = max(exp(logits - logits_max)) / sum(exp(logits - logits_max))
+    # Since logits_max is the max logit, exp(logits_max - logits_max) = 1
+    # So max softmax = 1 / sum(exp(logits - logits_max))
+    # But we can compute it more generally:
+    max_exp = exp_logits.max(dim=-1, keepdim=True).values
+    max_prob = (max_exp / sum_exp).squeeze(-1)
+    return max_prob
+
+
 def calculate_sum_pi_squared_from_logits(logits: torch.Tensor):
     """
     Compute exact sum of squared probabilities from logits.

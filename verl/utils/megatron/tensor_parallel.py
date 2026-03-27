@@ -151,6 +151,35 @@ def vocab_parallel_entropy(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
     return _VocabParallelEntropy.apply(vocab_parallel_logits)
 
 
+def vocab_parallel_max_prob(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
+    """Compute max probability over the full vocabulary when logits are sharded across TP ranks.
+
+    Used by ACPO to compute the surrogate entropy δ = 1 - max_v π(v).
+    No gradient is needed since δ is used as a detached weight.
+
+    Args:
+        vocab_parallel_logits: (total_nnz, vocab_size // tp_size)
+
+    Returns: (total_nnz,)
+    """
+    with torch.no_grad():
+        # Numerically stable softmax across TP-sharded vocab
+        local_max = vocab_parallel_logits.max(dim=-1, keepdim=True).values
+        # Global max across TP ranks
+        global_max = local_max.clone()
+        dist.all_reduce(global_max, op=dist.ReduceOp.MAX, group=mpu.get_tensor_model_parallel_group())
+        # Stable exp
+        exp_logits = (vocab_parallel_logits - global_max).exp()
+        # Global sum of exp
+        sum_exp = exp_logits.sum(dim=-1, keepdim=True)
+        dist.all_reduce(sum_exp, group=mpu.get_tensor_model_parallel_group())
+        # Local max of softmax = local max of exp / global sum
+        local_max_prob = exp_logits.max(dim=-1, keepdim=True).values / sum_exp
+        # Global max prob across TP ranks
+        dist.all_reduce(local_max_prob, op=dist.ReduceOp.MAX, group=mpu.get_tensor_model_parallel_group())
+        return local_max_prob.squeeze(-1)
+
+
 def vocab_parallel_log_probs_from_logits(logits, labels):
     """TODO(zhangchi.usc1992): We may change the implementation later"""
     from megatron.core import tensor_parallel

@@ -49,7 +49,7 @@ from verl.utils.megatron.router_replay_utils import (
     reorder_and_merge_vpp_layers,
     set_router_replay_data,
 )
-from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
+from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits, vocab_parallel_max_prob
 from verl.utils.megatron_utils import get_megatron_mtp_loss, get_model_config, unwrap_model
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
@@ -402,6 +402,7 @@ class MegatronPPOActor(BasePPOActor):
         forward_only=False,
         post_process_fn=None,
         calculate_entropy=False,
+        calculate_max_prob=False,
         use_dynamic_bsz=False,
         micro_batch_size=None,
         max_token_len=None,
@@ -477,10 +478,13 @@ class MegatronPPOActor(BasePPOActor):
             # We move calculation of entropy to compute_log_probs, forward_only == True
             log_probs = None
             entropy = None
+            max_prob_output = None
             if isinstance(output, dict):
                 log_probs = output["log_probs"]
                 if "entropy" in output:
                     entropy = output["entropy"]
+                if "max_prob" in output:
+                    max_prob_output = output["max_prob"]
             else:
                 assert isinstance(output, torch.Tensor)
                 log_probs = output
@@ -503,6 +507,9 @@ class MegatronPPOActor(BasePPOActor):
             loss_agg_mode = self.config.loss_agg_mode
             # compute policy loss
             log_prob = log_probs[:, -response_length - 1 : -1].contiguous()
+            max_prob = None
+            if max_prob_output is not None:
+                max_prob = max_prob_output[:, -response_length - 1 : -1].contiguous()
             ret_entropy = None
             stats = {}
             if not forward_only:
@@ -527,6 +534,7 @@ class MegatronPPOActor(BasePPOActor):
                     loss_agg_mode=loss_agg_mode,
                     config=self.config,
                     rollout_is_weights=rollout_is_weights,
+                    max_prob=max_prob,
                 )
                 stats.update(pg_metrics)
 
@@ -668,6 +676,9 @@ class MegatronPPOActor(BasePPOActor):
                         ret["entropy"] = entropy
                     else:
                         logits_bak = logits
+                    if calculate_max_prob:
+                        max_prob = vocab_parallel_max_prob(logits_bak)
+                        ret["max_prob"] = max_prob
                     log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ret["log_probs"] = log_probs
@@ -789,6 +800,7 @@ class MegatronPPOActor(BasePPOActor):
                 chunk.zero_grad_buffer()
 
             calculate_entropy = self.config.entropy_coeff != 0
+            calculate_max_prob = self.config.get("calculate_max_prob", False)
             if data.meta_info.get("micro_batch_size", None) is not None:
                 micro_batch_size = data.meta_info["micro_batch_size"]
             else:
@@ -799,6 +811,7 @@ class MegatronPPOActor(BasePPOActor):
             metric_micro_batch = self.forward_backward_batch(
                 data,
                 calculate_entropy=calculate_entropy,
+                calculate_max_prob=calculate_max_prob,
                 use_dynamic_bsz=self.config.use_dynamic_bsz,
                 micro_batch_size=micro_batch_size,
                 max_token_len=max_token_len,

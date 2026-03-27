@@ -159,6 +159,7 @@ class ActorConfig(BaseConfig):
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False
+    calculate_max_prob: bool = False  # compute max_v π(v) per token for ACPO surrogate entropy
     use_kl_loss: bool = False
     # Whether to enable PrefixGrouper-based shared-prefix forward
     use_prefix_grouper: bool = False

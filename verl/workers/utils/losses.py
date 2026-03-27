@@ -60,6 +60,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     entropy = model_output.get("entropy", None)
     if entropy is not None:
         entropy = no_padding_2_padding(entropy, data)
+    max_prob = model_output.get("max_prob", None)
+    if max_prob is not None:
+        max_prob = no_padding_2_padding(max_prob, data)
 
     # global batch info for loss aggregation
     config.global_batch_info["dp_size"] = data["dp_size"]
@@ -101,6 +104,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         loss_agg_mode=loss_agg_mode,
         config=config,
         rollout_is_weights=rollout_is_weights,
+        max_prob=max_prob,
     )
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens

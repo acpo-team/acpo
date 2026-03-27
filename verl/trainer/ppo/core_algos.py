@@ -42,7 +42,8 @@ PolicyLossFn = Callable[
         torch.Tensor,  # response_mask
         str,  # loss_agg_mode
         Optional[DictConfig | ActorConfig],  # config
-        torch.Tensor | None,  # rollout_log_probs
+        torch.Tensor | None,  # rollout_is_weights
+        torch.Tensor | None,  # max_prob (for ACPO surrogate entropy)
     ],
     tuple[torch.Tensor, dict[str, Any]],
 ]
@@ -1284,6 +1285,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -1378,6 +1380,7 @@ def compute_policy_loss_dppo_tv(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for DPPO-Binary-TV.
@@ -1459,6 +1462,7 @@ def compute_policy_loss_dppo_kl(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for DPPO-Binary-KL.
@@ -1544,6 +1548,7 @@ def compute_policy_loss_gspo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -1620,6 +1625,7 @@ def compute_policy_loss_sapo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the smoothed policy objective and related metrics for SAPO.
@@ -1696,6 +1702,122 @@ def compute_policy_loss_sapo(
     return pg_loss, pg_metrics
 
 
+@register_policy_loss("acpo")
+def compute_policy_loss_acpo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    max_prob: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """
+    Compute the Entropy-Modulated Advantage policy loss for ACPO.
+
+    ACPO applies a fine-grained surrogate entropy δ_{i,t}(θ) to the group-relative
+    advantage Â_i, yielding the Entropy-Modulated Advantage:
+
+        δ_{i,t}(θ) = 1 - max_v π_θ(v | q, y_{i,<t})
+
+        Â^{ACPO}_{i,t} =
+            (2 + δ_{i,t}(θ)) · Â_i,   if Â_i > 0   (positive reinforcement)
+            (1 - δ_{i,t}(θ)) · Â_i,   otherwise      (negative penalty)
+
+    For positive advantages (correct trajectories), higher-entropy (uncertain) tokens
+    receive amplified credit via (2 + δ), effectively amplifying the gradient of the
+    most informative steps. For negative advantages (incorrect trajectories), confident
+    errors (low δ) receive maximum penalty weight (1 - δ) → 1, while high-uncertainty
+    tokens are suppressed.
+
+    The loss uses PPO-style clipping on top of the modulated advantages.
+
+    Requires `max_prob` to be passed from the forward pass (computed from full logits).
+    Set `actor.calculate_max_prob=True` in config to enable this.
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask for valid tokens, shape (batch_size, response_length).
+        loss_agg_mode (str, optional):
+            Aggregation mode. Recommended: "seq-mean-token-mean".
+        config (ActorConfig, optional):
+            Actor configuration. Must not be None.
+        rollout_is_weights (torch.Tensor | None, optional):
+            Rollout importance sampling weights.
+        max_prob (torch.Tensor | None):
+            Max probability over vocab at each token position, shape (batch_size, response_length).
+            Computed from full logits as max_v softmax(logits)_v.
+    """
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+    assert max_prob is not None, (
+        "ACPO requires max_prob (max vocabulary probability per token). "
+        "Set `actor.calculate_max_prob=True` in your config."
+    )
+
+    clip_ratio = config.clip_ratio
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+
+    # ---- token-level importance ratio r_{i,t}(θ) ----
+    negative_approx_kl = log_prob - old_log_prob
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+
+    # ---- surrogate entropy δ_{i,t}(θ) = 1 - max_v π_θ(v | q, y_{i,<t}) ----
+    # Keep gradient through max_prob for end-to-end training
+    delta = 1.0 - max_prob  # δ ∈ [0, 1]
+
+    # ---- Entropy-Modulated Advantage Â^{ACPO}_{i,t} ----
+    # Positive reinforcement (Â_i > 0): weight = (2 + δ_{i,t})
+    #   → high-entropy (uncertain) correct tokens get amplified credit
+    # Negative penalty (Â_i ≤ 0): weight = (1 - δ_{i,t})
+    #   → confident errors (low δ) get maximum penalty, uncertain tokens suppressed
+    entropy_weight = torch.where(
+        advantages > 0,
+        2.0 + delta,     # positive reinforcement
+        1.0 - delta,     # negative penalty
+    )
+    modulated_advantages = entropy_weight * advantages
+
+    # ---- clipped policy gradient (PPO-style) with modulated advantages ----
+    pg_losses1 = -modulated_advantages * ratio
+    pg_losses2 = -modulated_advantages * torch.clamp(ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    # Apply rollout correction weights if provided
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    # Aggregate loss
+    pg_loss = agg_loss(
+        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean", **config.global_batch_info
+    )
+
+    # ---- metrics ----
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    mean_delta = verl_F.masked_mean(delta, response_mask)
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/acpo_mean_delta": mean_delta.detach().item(),
+    }
+
+    return pg_loss, pg_metrics
+
+
 @register_policy_loss("gpg")
 def compute_policy_loss_gpg(
     old_log_prob: torch.Tensor,
@@ -1705,6 +1827,7 @@ def compute_policy_loss_gpg(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Adapted from
     https://github.com/AMAP-ML/GPG/blob/main/VisualThinker-R1-Zero/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py#L495
@@ -1741,6 +1864,7 @@ def compute_policy_loss_clip_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1846,6 +1970,7 @@ def compute_policy_loss_kl_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1926,6 +2051,7 @@ def compute_policy_loss_geo_mean(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GMPO.
@@ -2012,6 +2138,7 @@ def compute_policy_loss_cispo(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for CISPO.
@@ -2355,6 +2482,7 @@ def compute_policy_loss_bypass_mode(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Bypass mode policy loss supporting both REINFORCE and PPO-clip.
 
